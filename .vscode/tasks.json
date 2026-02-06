@@ -1,0 +1,37 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build",
+			"type": "npm",
+			"script": "compile",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": "$tsc",
+			"presentation": {
+				"reveal": "silent"
+			}
+		},
+		{
+			"label": "watch",
+			"type": "npm",
+			"script": "watch",
+			"isBackground": true,
+			"group": "build",
+			"problemMatcher": {
+				"owner": "vite",
+				"pattern": { "regexp": "^$" },
+				"background": {
+					"activeOnStart": true,
+					"beginsPattern": "building",
+					"endsPattern": "built in|error"
+				}
+			},
+			"presentation": {
+				"reveal": "never"
+			}
+		}
+	]
+}
