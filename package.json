@@ -3,7 +3,7 @@
 	"displayName": "OpenRouter for VS Code",
 	"description": "OpenRouter models provider for VS Code Chat",
 	"version": "0.1.0",
-	"publisher": "your-name",
+	"publisher": "luckyone",
 	"engines": {
 		"vscode": "^1.93.0"
 	},
@@ -26,11 +26,6 @@
 		"configuration": {
 			"title": "OpenRouter",
 			"properties": {
-				"openrouter.modelFilter": {
-					"type": "array",
-					"default": [],
-					"description": "List of model IDs to show. Leave empty to show all (e.g. ['anthropic/claude-3.5-sonnet'])."
-				},
 				"openrouter.systemPrompt": {
 					"type": "string",
 					"default": "",
@@ -47,7 +42,7 @@
 		]
 	},
 	"scripts": {
-		"vscode:prepublish": "npm run package",
+		"vscode:prepublish": "pnpm run package",
 		"compile": "vite build",
 		"watch": "vite build --watch",
 		"package": "vite build --minify",
@@ -55,6 +50,7 @@
 		"check-types": "tsc --noEmit"
 	},
 	"devDependencies": {
+		"@biomejs/biome": "2.3.14",
 		"@types/node": "22.x",
 		"@types/vscode": "^1.93.0",
 		"@vscode/vsce": "^3.7.1",
