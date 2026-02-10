@@ -1,10 +1,52 @@
-import { OpenRouter } from "@openrouter/sdk";
-import { EventStream } from "@openrouter/sdk/lib/event-streams.js";
-import type { ChatGenerationParams } from "@openrouter/sdk/models";
-import { ChatError } from "@openrouter/sdk/models/errors";
+import OpenAI from "openai";
 import * as vscode from "vscode";
 import { OpenRouterAdapter } from "./adapter.js";
-import { REPOSITORY } from "./const.js";
+import { MODEL_ID_PREFIX, REPOSITORY } from "./const.js";
+
+// Same API shape as Copilot Chat's OpenRouter BYOK provider (openRouterProvider.ts)
+function getModelsBaseUrl(): string {
+	return "https://openrouter.ai/api/v1";
+}
+
+function getModelsDiscoveryUrl(modelsBaseUrl: string): string {
+	return `${modelsBaseUrl}/models`;
+}
+
+/** OpenRouter /models response item (see https://openrouter.ai/docs/api-reference/models) */
+interface OpenRouterModelData {
+	id: string;
+	name: string;
+	context_length?: number;
+	supported_parameters?: string[];
+	architecture?: { input_modalities?: string[] };
+	top_provider?: { context_length?: number; max_completion_tokens?: number };
+	pricing?: Record<string, unknown>;
+}
+
+interface ModelCapabilities {
+	name: string;
+	toolCalling: boolean;
+	vision: boolean;
+	maxInputTokens: number;
+	maxOutputTokens: number;
+}
+
+function resolveModelCapabilities(modelData: unknown): ModelCapabilities | undefined {
+	const m = modelData as OpenRouterModelData;
+	if (!m?.id) return undefined;
+	const contextLength = m.top_provider?.context_length ?? m.context_length ?? 0;
+	const maxOut = m.top_provider?.max_completion_tokens ?? 16000;
+	return {
+		name: m.name ?? m.id,
+		toolCalling: m.supported_parameters?.includes("tools") ?? false,
+		vision: m.architecture?.input_modalities?.includes("image") ?? false,
+		maxInputTokens: Math.max(0, contextLength - 16000),
+		maxOutputTokens: maxOut,
+	};
+}
+
+/** OpenRouter adds reasoning to delta; SDK types don't include it */
+type DeltaWithReasoning = { reasoning?: string };
 
 export type LanguageModelResponsePart2 =
 	| vscode.LanguageModelResponsePart
@@ -17,39 +59,73 @@ export class OpenRouterProvider implements vscode.LanguageModelChatProvider {
 
 	constructor(private readonly secrets: vscode.SecretStorage) {}
 
-	private async getApiKey(): Promise<string> {
+	private async getApiKey(silent?: boolean): Promise<string | undefined> {
 		let key = await this.secrets.get("openrouter.apiKey");
-		if (!key) {
+		if (!key && !silent) {
 			key = await vscode.window.showInputBox({
 				prompt: "Enter OpenRouter API key",
 				password: true,
 				ignoreFocusOut: true,
 			});
-			if (!key) throw new Error("API key required");
-			await this.secrets.store("openrouter.apiKey", key);
+			if (key) await this.secrets.store("openrouter.apiKey", key);
 		}
-		return key;
+		return key ?? undefined;
 	}
 
-	// @inheritdoc
+	// LanguageModelChatProvider: same as Copilot BYOK OpenRouter
 	async provideLanguageModelChatInformation(
-		_options: vscode.PrepareLanguageModelChatModelOptions,
-		_token: vscode.CancellationToken,
+		options: vscode.PrepareLanguageModelChatModelOptions,
+		token: vscode.CancellationToken,
 	): Promise<vscode.LanguageModelChatInformation[]> {
+		const silent = "silent" in options && options.silent === true;
+		const apiKey = await this.getApiKey(silent);
+		if (!apiKey && silent) return [];
+
 		if (this._cachedModels) return this._cachedModels;
-		const apiKey = await this.getApiKey();
-		const openRouter = new OpenRouter({ apiKey });
-		const { data } = await openRouter.models.list({
-			httpReferer: REPOSITORY,
-			xTitle: "VS Code OpenRouter",
+
+		const baseUrl = getModelsBaseUrl();
+		const url = getModelsDiscoveryUrl(baseUrl);
+		const controller = new AbortController();
+		token.onCancellationRequested(() => controller.abort());
+
+		const resp = await fetch(url, {
+			method: "GET",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+				"HTTP-Referer": REPOSITORY,
+				"X-Title": "VS Code OpenRouter",
+			},
+			signal: controller.signal,
 		});
-		this._cachedModels = data.map((m) =>
-			this.adapter.convertModelInformation(m),
-		);
+		if (!resp.ok) throw new Error(`OpenRouter models ${resp.status}: ${await resp.text()}`);
+
+		const data = (await resp.json()) as { data?: OpenRouterModelData[]; models?: OpenRouterModelData[] };
+		const models = data.data ?? data.models ?? [];
+		if (!Array.isArray(models)) throw new Error("Invalid OpenRouter models response");
+
+		const list: vscode.LanguageModelChatInformation[] = [];
+		for (const model of models) {
+			const cap = resolveModelCapabilities(model);
+			if (!cap) continue;
+			list.push({
+				id: MODEL_ID_PREFIX + model.id,
+				name: cap.name,
+				family: model.id.split("/")[0] ?? "unknown",
+				version: "latest",
+				maxInputTokens: cap.maxInputTokens,
+				maxOutputTokens: cap.maxOutputTokens,
+				capabilities: {
+					imageInput: cap.vision,
+					toolCalling: cap.toolCalling,
+				},
+			});
+		}
+		this._cachedModels = list;
 		return this._cachedModels;
 	}
 
-	// @inheritdoc
+	// LanguageModelChatProvider: stream chat completions (OpenAI-compatible endpoint)
 	async provideLanguageModelChatResponse(
 		model: vscode.LanguageModelChatInformation,
 		messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -57,133 +133,120 @@ export class OpenRouterProvider implements vscode.LanguageModelChatProvider {
 		progress: vscode.Progress<LanguageModelResponsePart2>,
 		token: vscode.CancellationToken,
 	): Promise<void> {
-		try {
-			const apiKey = await this.getApiKey();
-			const openRouter = new OpenRouter({ apiKey });
-			const modelId = this.adapter.getOpenRouterModelId(model.id);
+		const apiKey = await this.getApiKey(false);
+		if (!apiKey) throw new Error("API key required");
 
-			let orMessages = this.adapter.vscodeMessagesToOpenRouter(messages);
-			if (orMessages.length === 0) {
-				throw new Error("No messages to send.");
-			}
+		const modelId = this.adapter.getOpenRouterModelId(model.id);
+		let orMessages = this.adapter.vscodeMessagesToOpenRouter(messages);
+		if (orMessages.length === 0) throw new Error("No messages to send.");
 
-			const systemPromptOverride = vscode.workspace
-				.getConfiguration("openrouter")
-				.get<string>("systemPrompt")
-				?.trim();
+		const systemPromptOverride = vscode.workspace
+			.getConfiguration("openrouter")
+			.get<string>("systemPrompt")
+			?.trim();
+		if (systemPromptOverride) {
+			orMessages = orMessages.filter((msg) => msg.role !== "system");
+			orMessages.unshift({ role: "system", content: systemPromptOverride });
+		}
 
-			if (systemPromptOverride) {
-				orMessages = orMessages.filter((msg) => msg.role !== "system");
-				orMessages.unshift({ role: "system", content: systemPromptOverride });
-			}
+		const controller = new AbortController();
+		token.onCancellationRequested(() => controller.abort());
 
-			const chatGenerationParams: ChatGenerationParams = {
+		const openai = new OpenAI({
+			apiKey,
+			baseURL: getModelsBaseUrl(),
+			defaultHeaders: { "HTTP-Referer": REPOSITORY, "X-Title": "VS Code OpenRouter" },
+		});
+
+		const tools = this.adapter.convertTools(options.tools ?? []);
+		const stream = await openai.chat.completions.create(
+			{
 				model: modelId,
 				messages: orMessages,
 				stream: true,
-				toolChoice: "auto",
-				tools: this.adapter.convertTools(options.tools ?? []),
-				reasoning: {
-					summary: "detailed",
-				},
-			};
+				tool_choice: "auto",
+				tools: tools.length > 0 ? tools : undefined,
+				reasoning: { summary: "detailed" },
+			} as Parameters<OpenAI["chat"]["completions"]["create"]>[0],
+			{ signal: controller.signal },
+		);
 
-			const controller = new AbortController();
-			token.onCancellationRequested(() => {
-				controller.abort();
-			});
+		let thinkingActive = false;
+		let reportedText = false;
+		let reportedToolCall = false;
+		const toolCallAccum = new Map<number, { id: string; name: string; argsStr: string }>();
 
-			const resp = await openRouter.chat.send(
-				{
-					xTitle: "VS Code OpenRouter",
-					httpReferer: REPOSITORY,
-					chatGenerationParams,
-				},
-				{
-					signal: controller.signal,
-				},
-			);
+		const iterable = stream as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
+		for await (const chunk of iterable) {
+			for (const choice of chunk.choices ?? []) {
+				const delta = choice.delta as typeof choice.delta & DeltaWithReasoning;
+				if (!delta) continue;
 
-			if (resp instanceof EventStream) {
-				let thinkingActive = false;
-
-				for await (const chunk of resp) {
-					if (chunk.error) {
-						throw new Error(chunk.error.message);
-					}
-
-					for (const element of chunk.choices) {
-						// Handle reasoning/thinking
-						if (element.delta?.reasoning) {
-							progress.report(
-								new vscode.LanguageModelThinkingPart(
-									element.delta.reasoning,
-									"", // id
-									{}, // metadata
-								),
-							);
-							thinkingActive = true;
-						} else if (thinkingActive && !element.delta?.reasoning) {
-							// Signal end of thinking
-							progress.report(
-								new vscode.LanguageModelThinkingPart("", "", {
-									vscode_reasoning_done: true,
-								}),
-							);
-							thinkingActive = false;
-						}
-
-						// Handle text content
-						if (element.delta?.content) {
-							const part = new vscode.LanguageModelTextPart(
-								element.delta.content,
-							);
-							progress.report(part);
-						}
-
-						// Handle tool calls
-						if (element.delta.toolCalls) {
-							for (const toolCall of element.delta.toolCalls) {
-								const part = new vscode.LanguageModelToolCallPart(
-									toolCall.id ?? "",
-									toolCall.function?.name ?? "",
-									JSON.parse(toolCall.function?.arguments ?? "{}"),
-								);
-								progress.report(part);
-							}
-						}
-					}
-
-					// Final chunk includes usage stats
-					if (chunk.usage) {
-						console.log("Usage:", chunk.usage);
-					}
+				const reasoning = delta.reasoning;
+				if (reasoning) {
+					progress.report(new vscode.LanguageModelThinkingPart(reasoning, "", {}));
+					thinkingActive = true;
+				} else if (thinkingActive) {
+					progress.report(new vscode.LanguageModelThinkingPart("", "", { vscode_reasoning_done: true }));
+					thinkingActive = false;
 				}
 
-				// Ensure thinking is marked as complete at end of stream
-				if (thinkingActive) {
-					progress.report(
-						new vscode.LanguageModelThinkingPart("", "", {
-							vscode_reasoning_done: true,
-						}),
-					);
+				if (delta.content?.trim()) {
+					progress.report(new vscode.LanguageModelTextPart(delta.content));
+					reportedText = true;
 				}
-			} else {
-				// TODO: Handle non-streaming response if needed
+
+				const toolCalls = delta.tool_calls;
+				if (toolCalls?.length) {
+					for (const toolCall of toolCalls) {
+						const index = toolCall.index ?? 0;
+						let acc = toolCallAccum.get(index);
+						if (!acc) {
+							acc = { id: "", name: "", argsStr: "" };
+							toolCallAccum.set(index, acc);
+						}
+						if (toolCall.id != null && toolCall.id !== "") acc.id = toolCall.id;
+						if (toolCall.function?.name != null && toolCall.function.name !== "") acc.name = toolCall.function.name;
+						const argStr = toolCall.function?.arguments;
+						if (argStr != null) acc.argsStr += argStr;
+
+						let args: object;
+						try {
+							args = acc.argsStr.length > 0 ? (JSON.parse(acc.argsStr) as object) : {};
+						} catch {
+							continue;
+						}
+						progress.report(new vscode.LanguageModelToolCallPart(acc.id, acc.name, args));
+						reportedToolCall = true;
+					}
+				}
 			}
-		} catch (err) {
-			if (err instanceof ChatError) {
-				throw new Error(`OpenRouter API Error:\n${err.body}`);
+		}
+
+		for (const acc of toolCallAccum.values()) {
+			if (acc.argsStr.length === 0) continue;
+			try {
+				JSON.parse(acc.argsStr);
+			} catch {
+				progress.report(new vscode.LanguageModelToolCallPart(acc.id, acc.name, {}));
+				reportedToolCall = true;
 			}
-			const msg = err instanceof Error ? err.message : String(err);
-			throw new Error(msg);
+		}
+
+		if (thinkingActive) {
+			progress.report(new vscode.LanguageModelThinkingPart("", "", { vscode_reasoning_done: true }));
+		}
+
+		if (!reportedText && !reportedToolCall) {
+			progress.report(new vscode.LanguageModelTextPart(" "));
 		}
 	}
 
-	// @inheritdoc
+	// LanguageModelChatProvider
 	async provideTokenCount(
 		_model: vscode.LanguageModelChatInformation,
 		text: string | vscode.LanguageModelChatRequestMessage,
+		_token: vscode.CancellationToken,
 	): Promise<number> {
 		const content = typeof text === "string" ? text : JSON.stringify(text);
 		return Math.ceil(content.length / 3);

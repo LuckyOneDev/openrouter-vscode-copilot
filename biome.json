@@ -6,7 +6,8 @@
 		"useIgnoreFile": true
 	},
 	"files": {
-		"includes": ["**", "!!**/dist"]
+		"includes": ["**", "!!**/dist"],
+		"ignore": ["vscode-copilot-chat-main/**"]
 	},
 	"formatter": {
 		"enabled": true,
