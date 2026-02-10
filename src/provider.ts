@@ -6,6 +6,11 @@ import * as vscode from "vscode";
 import { OpenRouterAdapter } from "./adapter.js";
 import { REPOSITORY } from "./const.js";
 
+export type LanguageModelResponsePart2 =
+	| vscode.LanguageModelResponsePart
+	| vscode.LanguageModelDataPart
+	| vscode.LanguageModelThinkingPart;
+
 export class OpenRouterProvider implements vscode.LanguageModelChatProvider {
 	private _cachedModels: vscode.LanguageModelChatInformation[] | undefined;
 	private readonly adapter = new OpenRouterAdapter();
@@ -49,7 +54,7 @@ export class OpenRouterProvider implements vscode.LanguageModelChatProvider {
 		model: vscode.LanguageModelChatInformation,
 		messages: readonly vscode.LanguageModelChatRequestMessage[],
 		options: vscode.ProvideLanguageModelChatResponseOptions,
-		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+		progress: vscode.Progress<LanguageModelResponsePart2>,
 		token: vscode.CancellationToken,
 	): Promise<void> {
 		try {
@@ -100,18 +105,43 @@ export class OpenRouterProvider implements vscode.LanguageModelChatProvider {
 			);
 
 			if (resp instanceof EventStream) {
+				let thinkingActive = false;
+
 				for await (const chunk of resp) {
 					if (chunk.error) {
 						throw new Error(chunk.error.message);
 					}
 
 					for (const element of chunk.choices) {
+						// Handle reasoning/thinking
+						if (element.delta?.reasoning) {
+							progress.report(
+								new vscode.LanguageModelThinkingPart(
+									element.delta.reasoning,
+									"", // id
+									{}, // metadata
+								),
+							);
+							thinkingActive = true;
+						} else if (thinkingActive && !element.delta?.reasoning) {
+							// Signal end of thinking
+							progress.report(
+								new vscode.LanguageModelThinkingPart("", "", {
+									vscode_reasoning_done: true,
+								}),
+							);
+							thinkingActive = false;
+						}
+
+						// Handle text content
 						if (element.delta?.content) {
 							const part = new vscode.LanguageModelTextPart(
 								element.delta.content,
 							);
 							progress.report(part);
 						}
+
+						// Handle tool calls
 						if (element.delta.toolCalls) {
 							for (const toolCall of element.delta.toolCalls) {
 								const part = new vscode.LanguageModelToolCallPart(
@@ -122,19 +152,21 @@ export class OpenRouterProvider implements vscode.LanguageModelChatProvider {
 								progress.report(part);
 							}
 						}
-						if (element.delta.reasoning) {
-							// TODO: correctly handle reasoning
-							const part = new vscode.LanguageModelTextPart(
-								`reasoning: ${element.delta.reasoning}`,
-							);
-							progress.report(part);
-						}
 					}
 
 					// Final chunk includes usage stats
 					if (chunk.usage) {
 						console.log("Usage:", chunk.usage);
 					}
+				}
+
+				// Ensure thinking is marked as complete at end of stream
+				if (thinkingActive) {
+					progress.report(
+						new vscode.LanguageModelThinkingPart("", "", {
+							vscode_reasoning_done: true,
+						}),
+					);
 				}
 			} else {
 				// TODO: Handle non-streaming response if needed
